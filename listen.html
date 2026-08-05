@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#14151a">
+<title>Desk Mic</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    background: linear-gradient(160deg, #14151a 0%, #1b1c22 60%, #101116 100%);
+    color: #eee; margin: 0; min-height: 100vh; padding: 32px 16px 40px;
+  }
+  .wrap { max-width: 400px; margin: 0 auto; }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: .3px; margin: 0 0 2px; text-align: center; }
+  .sub { color: #7d8493; font-size: 12px; text-align: center; margin-bottom: 20px; }
+  .card {
+    background: #1c1e26; border: 1px solid #2a2d38; border-radius: 18px;
+    padding: 20px; margin-bottom: 16px; box-shadow: 0 8px 24px rgba(0,0,0,.35);
+  }
+  label { display: block; font-size: 13px; color: #aab0bd; margin-bottom: 8px; }
+  input[type=password], input[type=text] {
+    width: 100%; padding: 12px; font-size: 15px; font-family: inherit;
+    border-radius: 12px; border: 1px solid #33374a; background: #14151a; color: #eee;
+  }
+  input:focus { outline: none; border-color: #3a7bd5; }
+  button {
+    width: 100%; padding: 16px; margin-top: 14px; border: 0; border-radius: 12px;
+    font-size: 16px; font-weight: 600; font-family: inherit; color: #fff; cursor: pointer;
+    background: linear-gradient(135deg, #5b8cff, #3a7bd5); letter-spacing: .3px;
+    transition: filter .15s;
+  }
+  button:active { filter: brightness(.9); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.live { background: linear-gradient(135deg, #ff6b6b, #d63d3d); }
+  /* Signature element: the meter is fed from the actual PCM samples, so it
+     doubles as the "is audio really arriving" diagnostic. */
+  .meter { display: flex; gap: 3px; height: 46px; align-items: flex-end; margin-top: 18px; }
+  .meter i {
+    flex: 1; background: #262933; border-radius: 2px; height: 12%;
+    transition: height .08s linear, background .08s linear;
+  }
+  .statusRow { display: flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 13px; color: #aab0bd; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #8410; flex: none; }
+  .dot.on { background: #4ade80; }
+  .dot.off { background: #6a7182; }
+  .dot.rec { background: #ff5b5b; animation: pulse 1.4s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+  .note { font-size: 11px; color: #6a7182; margin-top: 14px; line-height: 1.6; }
+  .err { color: #ff9a8a; font-size: 12px; margin-top: 12px; min-height: 16px; }
+  @media (prefers-reduced-motion: reduce) { .dot.rec { animation: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Desk Mic</h1>
+  <div class="sub">Ekantakuna &middot; live audio from the desk display</div>
+
+  <div class="card">
+    <label for="token">Listen token</label>
+    <input id="token" type="password" autocomplete="off" placeholder="Paste your listen token">
+    <button id="btn" onclick="toggle()">Start listening</button>
+
+    <div class="meter" id="meter"></div>
+
+    <div class="statusRow">
+      <span class="dot off" id="devDot"></span>
+      <span id="devText">Not connected</span>
+    </div>
+    <div class="err" id="err"></div>
+    <div class="note">
+      The desk display shows LIVE MIC and turns its LED red whenever audio is
+      leaving the device. Closing this page stops the mic.
+    </div>
+  </div>
+</div>
+
+<script>
+const BARS = 18;
+const SAMPLE_RATE = 16000;   // must match AUDIO_SAMPLE_RATE in the sketch
+const JITTER_BUFFER = 0.30;  // seconds of slack before playback starts
+
+let ws = null, ctx = null, playAt = 0;
+let listening = false, deviceOnline = false, level = 0;
+
+const $ = id => document.getElementById(id);
+const meterEl = $('meter');
+for (let i = 0; i < BARS; i++) meterEl.appendChild(document.createElement('i'));
+const bars = meterEl.querySelectorAll('i');
+
+// ---------------------------------------------------------------------------
+// UI state
+// ---------------------------------------------------------------------------
+function render() {
+  const btn = $('btn');
+  btn.innerText = listening ? 'Stop listening' : 'Start listening';
+  btn.classList.toggle('live', listening);
+
+  const dot = $('devDot');
+  dot.className = 'dot ' + (listening && deviceOnline ? 'rec' : deviceOnline ? 'on' : 'off');
+
+  $('devText').innerText =
+    !ws || ws.readyState > 1 ? 'Not connected' :
+    !deviceOnline           ? 'Waiting for the desk display' :
+    listening               ? 'Mic is open' :
+                              'Desk display ready';
+}
+
+function fail(msg) { $('err').innerText = msg || ''; }
+
+// ---------------------------------------------------------------------------
+// Session
+// ---------------------------------------------------------------------------
+function toggle() { listening ? stop() : start(); }
+
+async function start() {
+  const token = $('token').value.trim();
+  if (!token) { fail('Enter your listen token first.'); return; }
+  localStorage.setItem('listenToken', token);
+  fail('');
+
+  // Must be created inside the tap, or mobile browsers keep it suspended.
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  await ctx.resume();
+  playAt = 0;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(proto + '://' + location.host + '/?role=listen&token=' + encodeURIComponent(token));
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => { listening = true; ws.send('start'); render(); };
+
+  ws.onmessage = ev => {
+    if (typeof ev.data === 'string') {
+      let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.type === 'device') { deviceOnline = msg.online; if (msg.online) fail(''); render(); }
+      if (msg.type === 'error') fail(msg.message);
+      return;
+    }
+    play(new Int16Array(ev.data));
+  };
+
+  ws.onclose = ev => {
+    if (ev.code === 1008) fail('That token was rejected.');
+    teardown();
+  };
+  ws.onerror = () => fail('Could not reach the relay.');
+
+  render();
+}
+
+function stop() {
+  if (ws && ws.readyState === 1) { ws.send('stop'); ws.close(); }
+  teardown();
+}
+
+function teardown() {
+  listening = false;
+  if (ctx) { ctx.close(); ctx = null; }
+  ws = null;
+  level = 0;
+  render();
+}
+
+// ---------------------------------------------------------------------------
+// Playback: each frame becomes an AudioBuffer scheduled end to end. Creating
+// the buffer at 16 kHz inside a 44.1/48 kHz context makes the browser resample
+// it for us, which is why the context runs at its own native rate.
+// ---------------------------------------------------------------------------
+function play(samples) {
+  if (!ctx || !samples.length) return;
+
+  const buf = ctx.createBuffer(1, samples.length, SAMPLE_RATE);
+  const ch = buf.getChannelData(0);
+  let peak = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i] / 32768;
+    ch[i] = v;
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+  }
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  // Underrun (network hiccup, or the very first frame): rebuild the buffer
+  // rather than scheduling in the past, which browsers play instantly and
+  // turns into a burst of overlapping audio.
+  if (playAt < ctx.currentTime + 0.05) playAt = ctx.currentTime + JITTER_BUFFER;
+  src.start(playAt);
+  playAt += buf.duration;
+
+  level = Math.max(peak, level * 0.75);
+}
+
+// ---------------------------------------------------------------------------
+// Meter. Decays on its own so silence reads as silence, not a frozen bar.
+// ---------------------------------------------------------------------------
+function drawMeter() {
+  level *= 0.88;
+  const lit = Math.round(Math.min(1, Math.sqrt(level) * 1.4) * BARS);
+  for (let i = 0; i < BARS; i++) {
+    const on = listening && i < lit;
+    bars[i].style.height = on ? (18 + (i / BARS) * 82) + '%' : '12%';
+    bars[i].style.background = on ? (i > BARS - 4 ? '#ff6b6b' : '#5b8cff') : '#262933';
+  }
+  requestAnimationFrame(drawMeter);
+}
+drawMeter();
+
+// Leaving the page closes the socket, which tells the relay to close the mic.
+window.addEventListener('pagehide', () => { if (ws && ws.readyState === 1) { ws.send('stop'); ws.close(); } });
+
+$('token').value = localStorage.getItem('listenToken') || '';
+render();
+</script>
+</body>
+</html>
