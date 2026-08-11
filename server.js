@@ -167,8 +167,9 @@ const server = http.createServer((req, res) => {
     if (talkRes) { try { talkRes.end(); } catch (_) {} }
 
     talkRes = res;
-    res.writeHead(200, {
+   res.writeHead(200, {
       'Content-Type': 'audio/wav',
+      'Content-Length': '2147483647',   // "effectively endless", no chunking
       'Cache-Control': 'no-store',
       'Connection': 'close'
     });
