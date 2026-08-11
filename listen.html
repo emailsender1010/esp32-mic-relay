@@ -34,6 +34,14 @@
   button:active { filter: brightness(.9); }
   button:disabled { opacity: .45; cursor: default; }
   button.live { background: linear-gradient(135deg, #ff6b6b, #d63d3d); }
+  /* Hold-to-talk. Half duplex on purpose: while you hold it the device
+     closes its own mic, which is what stops your voice looping back. */
+  #talkBtn {
+    background: linear-gradient(135deg, #2fa679, #1f7a58);
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+    touch-action: none;
+  }
+  #talkBtn.talking { background: linear-gradient(135deg, #5bd1a5, #2fa679); box-shadow: 0 0 0 3px rgba(91,209,165,.25); }
   /* Signature element: the meter is fed from the actual PCM samples, so it
      doubles as the "is audio really arriving" diagnostic. */
   .meter { display: flex; gap: 3px; height: 46px; align-items: flex-end; margin-top: 18px; }
@@ -46,10 +54,11 @@
   .dot.on { background: #4ade80; }
   .dot.off { background: #6a7182; }
   .dot.rec { background: #ff5b5b; animation: pulse 1.4s ease-in-out infinite; }
+  .dot.talk { background: #5bd1a5; animation: pulse 1.4s ease-in-out infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
   .note { font-size: 11px; color: #6a7182; margin-top: 14px; line-height: 1.6; }
   .err { color: #ff9a8a; font-size: 12px; margin-top: 12px; min-height: 16px; }
-  @media (prefers-reduced-motion: reduce) { .dot.rec { animation: none; } }
+  @media (prefers-reduced-motion: reduce) { .dot.rec, .dot.talk { animation: none; } }
 </style>
 </head>
 <body>
@@ -61,6 +70,7 @@
     <label for="token">Listen token</label>
     <input id="token" type="password" autocomplete="off" placeholder="Paste your listen token">
     <button id="btn" onclick="toggle()">Start listening</button>
+    <button id="talkBtn" disabled>Hold to talk</button>
 
     <div class="meter" id="meter"></div>
 
@@ -70,8 +80,10 @@
     </div>
     <div class="err" id="err"></div>
     <div class="note">
-      The desk display shows LIVE MIC and turns its LED red whenever audio is
-      leaving the device. Closing this page stops the mic.
+      The desk display shows a red dot while audio is leaving the device, and
+      a cyan one while your voice is coming out of its speaker. Holding Talk
+      closes the device's mic so you don't hear yourself echo. Closing this
+      page stops both.
     </div>
   </div>
 </div>
@@ -80,9 +92,14 @@
 const BARS = 18;
 const SAMPLE_RATE = 16000;   // must match AUDIO_SAMPLE_RATE in the sketch
 const JITTER_BUFFER = 0.30;  // seconds of slack before playback starts
+const TALK_FRAME = 320;      // samples per outgoing frame (20ms at 16kHz)
 
 let ws = null, ctx = null, playAt = 0;
 let listening = false, deviceOnline = false, level = 0;
+
+// Talkback
+let talking = false, micStream = null, micNode = null, micSink = null;
+let talkPhase = 0, talkFrame = new Int16Array(TALK_FRAME), talkFill = 0;
 
 const $ = id => document.getElementById(id);
 const meterEl = $('meter');
@@ -97,12 +114,18 @@ function render() {
   btn.innerText = listening ? 'Stop listening' : 'Start listening';
   btn.classList.toggle('live', listening);
 
+  const talkBtn = $('talkBtn');
+  talkBtn.disabled = !(listening && deviceOnline);
+  talkBtn.classList.toggle('talking', talking);
+  talkBtn.innerText = talking ? 'Talking — release to stop' : 'Hold to talk';
+
   const dot = $('devDot');
-  dot.className = 'dot ' + (listening && deviceOnline ? 'rec' : deviceOnline ? 'on' : 'off');
+  dot.className = 'dot ' + (talking ? 'talk' : listening && deviceOnline ? 'rec' : deviceOnline ? 'on' : 'off');
 
   $('devText').innerText =
     !ws || ws.readyState > 1 ? 'Not connected' :
     !deviceOnline           ? 'Waiting for the desk display' :
+    talking                 ? 'Your voice is on the desk speaker' :
     listening               ? 'Mic is open' :
                               'Desk display ready';
 }
@@ -135,6 +158,7 @@ async function start() {
     if (typeof ev.data === 'string') {
       let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
       if (msg.type === 'device') { deviceOnline = msg.online; if (msg.online) fail(''); render(); }
+      if (msg.type === 'talk' && !msg.active && talking) endTalk();
       if (msg.type === 'error') fail(msg.message);
       return;
     }
@@ -151,6 +175,7 @@ async function start() {
 }
 
 function stop() {
+  endTalk();
   if (ws && ws.readyState === 1) { ws.send('stop'); ws.close(); }
   teardown();
 }
@@ -161,6 +186,104 @@ function teardown() {
   ws = null;
   level = 0;
   render();
+}
+
+// ---------------------------------------------------------------------------
+// Talkback: capture the phone mic, resample to 16 kHz, ship Int16 frames.
+// The AudioWorklet is defined inline so this stays a single file.
+// ---------------------------------------------------------------------------
+const WORKLET_SRC = `
+class MicTap extends AudioWorkletProcessor {
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) this.port.postMessage(new Float32Array(ch));
+    return true;
+  }
+}
+registerProcessor('mic-tap', MicTap);
+`;
+
+async function beginTalk() {
+  if (talking || !listening || !deviceOnline || !ctx) return;
+  talking = true;   // set early so a fast double-tap can't start twice
+  render();
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+               channelCount: 1 },
+      video: false
+    });
+  } catch (e) {
+    talking = false;
+    fail('Microphone permission was refused.');
+    render();
+    return;
+  }
+  if (!talking || !ctx) { stopMicTracks(); return; } // released while waiting
+
+  const blobUrl = URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'application/javascript' }));
+  await ctx.audioWorklet.addModule(blobUrl);
+  URL.revokeObjectURL(blobUrl);
+  if (!talking || !ctx) { stopMicTracks(); return; }
+
+  const src = ctx.createMediaStreamSource(micStream);
+  micNode = new AudioWorkletNode(ctx, 'mic-tap');
+  micNode.port.onmessage = ev => pushMic(ev.data);
+
+  // A worklet only runs while it's connected to the graph, but routing it
+  // to the speakers would put your own voice in your ear - so it lands in
+  // a muted gain node instead.
+  micSink = ctx.createGain();
+  micSink.gain.value = 0;
+  src.connect(micNode);
+  micNode.connect(micSink);
+  micSink.connect(ctx.destination);
+
+  talkPhase = 0; talkFill = 0;
+  if (ws && ws.readyState === 1) ws.send('talk_start');
+  render();
+}
+
+function endTalk() {
+  if (!talking) return;
+  talking = false;
+  if (ws && ws.readyState === 1) ws.send('talk_stop');
+  if (micNode) { try { micNode.port.onmessage = null; micNode.disconnect(); } catch (_) {} micNode = null; }
+  if (micSink) { try { micSink.disconnect(); } catch (_) {} micSink = null; }
+  stopMicTracks();
+  talkFill = 0;
+  render();
+}
+
+function stopMicTracks() {
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+}
+
+// Decimate from the context's native rate down to 16 kHz. Good enough for
+// speech, and it keeps the fractional remainder across callbacks so the
+// pitch doesn't wander.
+function pushMic(f32) {
+  if (!talking || !ws || ws.readyState !== 1 || !ctx) return;
+  const ratio = ctx.sampleRate / SAMPLE_RATE;
+  let peak = 0;
+
+  while (talkPhase < f32.length) {
+    let v = f32[talkPhase | 0];
+    if (v > 1) v = 1; else if (v < -1) v = -1;
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+
+    talkFrame[talkFill++] = v * 32767;
+    if (talkFill === TALK_FRAME) {
+      ws.send(talkFrame.buffer.slice(0));
+      talkFill = 0;
+    }
+    talkPhase += ratio;
+  }
+  talkPhase -= f32.length;
+
+  level = Math.max(peak, level * 0.75); // meter shows what you're sending
 }
 
 // ---------------------------------------------------------------------------
@@ -200,17 +323,30 @@ function play(samples) {
 function drawMeter() {
   level *= 0.88;
   const lit = Math.round(Math.min(1, Math.sqrt(level) * 1.4) * BARS);
+  const hot = talking ? '#5bd1a5' : '#5b8cff';
   for (let i = 0; i < BARS; i++) {
     const on = listening && i < lit;
     bars[i].style.height = on ? (18 + (i / BARS) * 82) + '%' : '12%';
-    bars[i].style.background = on ? (i > BARS - 4 ? '#ff6b6b' : '#5b8cff') : '#262933';
+    bars[i].style.background = on ? (i > BARS - 4 ? '#ff6b6b' : hot) : '#262933';
   }
   requestAnimationFrame(drawMeter);
 }
 drawMeter();
 
+// Hold-to-talk wiring. Pointer events cover mouse and touch; the extra
+// cancel/leave handlers stop a dropped finger from leaving the mic open.
+const talkBtn = $('talkBtn');
+talkBtn.addEventListener('pointerdown', e => { e.preventDefault(); beginTalk(); });
+talkBtn.addEventListener('pointerup', e => { e.preventDefault(); endTalk(); });
+talkBtn.addEventListener('pointercancel', endTalk);
+talkBtn.addEventListener('pointerleave', endTalk);
+talkBtn.addEventListener('contextmenu', e => e.preventDefault());
+
 // Leaving the page closes the socket, which tells the relay to close the mic.
-window.addEventListener('pagehide', () => { if (ws && ws.readyState === 1) { ws.send('stop'); ws.close(); } });
+window.addEventListener('pagehide', () => {
+  endTalk();
+  if (ws && ws.readyState === 1) { ws.send('stop'); ws.close(); }
+});
 
 $('token').value = localStorage.getItem('listenToken') || '';
 render();
